@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -37,17 +39,29 @@ func main() {
 	a := application.New(s)
 	srv := &http.Server{Addr: address(*addr), Handler: web.New(a).Handler()}
 	if *self {
-		go srv.ListenAndServe()
-		e := runSelfCheck(a)
+		ln, e := net.Listen("tcp", srv.Addr)
+		if e != nil {
+			panic(e)
+		}
+		serveErr := make(chan error, 1)
+		go func() { serveErr <- srv.Serve(ln) }()
+		e = runSelfCheck(a)
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		srv.Shutdown(ctx)
 		cancel()
 		if e != nil {
 			panic(e)
 		}
+		if err := <-serveErr; err != nil && !errors.Is(err, http.ErrServerClosed) {
+			panic(err)
+		}
 		return
 	}
-	go srv.ListenAndServe()
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			panic(err)
+		}
+	}()
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
 	<-ch
