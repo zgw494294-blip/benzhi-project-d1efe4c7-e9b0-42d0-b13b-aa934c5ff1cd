@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"tactile-review/internal/compliance"
 	"tactile-review/internal/domain"
@@ -227,12 +228,30 @@ func validateResponses(c *domain.ReleaseCase, responses []domain.ReviewResponse)
 	return nil
 }
 func (a *Service) AddRevision(id string, expected int, r domain.PlateRevision, key string) (*domain.ReleaseCase, error) {
+	if strings.TrimSpace(key) == "" {
+		return nil, fmt.Errorf("idempotency_key 不能为空")
+	}
+	// Normalize the input first so the request digest is stable across retries.
+	// PreviewRevision normalizes again, but computing the digest from the
+	// normalized form keeps the idempotency boundary independent of the
+	// aggregate version, which has already advanced after the first successful
+	// submission.
+	nr := normalizeRevision(r)
+	nr.CaseID = id
+	requestDigest := domain.HashText(strings.Join([]string{id, strconv.Itoa(expected), domain.RevisionInputDigest(nr)}, "\x1f"))
+	// Replay path: a prior submission under the same key already succeeded.
+	// This check must run before any version-sensitive validation so a retry
+	// using the original expectedVersion returns the first result instead of a
+	// version conflict, and so a distinct request under the same key is rejected
+	// rather than being treated as a new revision.
+	if replay, reused, err := a.Store.RevisionIdempotencyReplay(id, key, requestDigest); err != nil {
+		return nil, err
+	} else if reused {
+		return replay, nil
+	}
 	p, err := a.PreviewRevision(id, expected, r)
 	if err != nil {
 		return nil, err
-	}
-	if strings.TrimSpace(key) == "" {
-		return nil, fmt.Errorf("idempotency_key 不能为空")
 	}
 	c, err := a.Store.Get(id)
 	if err != nil {
@@ -268,10 +287,11 @@ func (a *Service) AddRevision(id string, expected int, r domain.PlateRevision, k
 			}
 		}
 	}
-	if err = a.Store.SaveWithAudit(c, expected, "REVISION_CREATED", r.SubmittedBy, map[string]string{"revision_id": r.ID, "input_digest": domain.RevisionInputDigest(r), "idempotency_key": key, "check_run_id": checkRunID}); err != nil {
+	result, _, err := a.Store.SaveRevisionIdempotent(c, expected, key, requestDigest, "REVISION_CREATED", r.SubmittedBy, map[string]string{"revision_id": r.ID, "input_digest": domain.RevisionInputDigest(r), "idempotency_key": key, "check_run_id": checkRunID})
+	if err != nil {
 		return nil, err
 	}
-	return c, nil
+	return result, nil
 }
 
 func (a *Service) Check(id string, expected int) (*domain.ReleaseCase, error) {

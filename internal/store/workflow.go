@@ -125,6 +125,134 @@ func (s *Store) SaveWithAudit(c *domain.ReleaseCase, expectedVersion int, action
 	})
 }
 
+// revisionIdempotencyKey is the storage key for a revision idempotency record.
+// It is namespaced per case so the same client key can be reused for different
+// cases without colliding.
+func revisionIdempotencyKey(caseID, key string) []byte {
+	return []byte("revision:" + caseID + ":" + key)
+}
+
+// RevisionIdempotencyReplay returns the previously persisted case for a
+// revision submission when the same (caseID, key, requestDigest) triple was
+// already recorded. It returns (nil, false, nil) when no record exists yet, so
+// the caller can proceed with the first-time submission path. When a record
+// exists but the requestDigest differs, ErrIdempotencyConflict is returned so a
+// distinct business request under the same key is never silently replayed or
+// treated as a new revision.
+func (s *Store) RevisionIdempotencyReplay(caseID, key, requestDigest string) (*domain.ReleaseCase, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var result *domain.ReleaseCase
+	reused := false
+	err := s.db.View(func(tx *bbolt.Tx) error {
+		ib := tx.Bucket(idempotencyBucket)
+		if ib == nil {
+			return nil
+		}
+		raw := ib.Get(revisionIdempotencyKey(caseID, key))
+		if raw == nil {
+			return nil
+		}
+		var rec IdempotencyRecord
+		if err := json.Unmarshal(raw, &rec); err != nil {
+			return err
+		}
+		if rec.RequestDigest != requestDigest {
+			return domain.ErrIdempotencyConflict
+		}
+		rawCase := tx.Bucket(bucket).Get([]byte(rec.CaseID))
+		if rawCase == nil {
+			return domain.ErrNotFound
+		}
+		var existing domain.ReleaseCase
+		if err := json.Unmarshal(rawCase, &existing); err != nil {
+			return err
+		}
+		cp := existing
+		result, reused = &cp, true
+		return nil
+	})
+	return result, reused, err
+}
+
+// SaveRevisionIdempotent persists a revision write atomically with its
+// idempotency record. On retry with the same key:
+//   - if the request digest matches, the previously persisted case is returned
+//     with reused=true (safe replay of the first successful result);
+//   - if the request digest differs, ErrIdempotencyConflict is returned,
+//     preventing a distinct business request from being silently replayed or
+//     treated as a new revision under the same key.
+//
+// On the first submission it performs the optimistic-concurrency version check,
+// writes the case, appends the audit entry and records the idempotency marker
+// in a single transaction so partial writes cannot occur.
+func (s *Store) SaveRevisionIdempotent(c *domain.ReleaseCase, expectedVersion int, key, requestDigest, action, actor string, metadata map[string]string) (*domain.ReleaseCase, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var result *domain.ReleaseCase
+	reused := false
+	err := s.db.Update(func(tx *bbolt.Tx) error {
+		ib := tx.Bucket(idempotencyBucket)
+		ik := revisionIdempotencyKey(c.ID, key)
+		if raw := ib.Get(ik); raw != nil {
+			var rec IdempotencyRecord
+			if err := json.Unmarshal(raw, &rec); err != nil {
+				return err
+			}
+			if rec.RequestDigest != requestDigest {
+				return domain.ErrIdempotencyConflict
+			}
+			rawCase := tx.Bucket(bucket).Get([]byte(rec.CaseID))
+			if rawCase == nil {
+				return domain.ErrNotFound
+			}
+			var existing domain.ReleaseCase
+			if err := json.Unmarshal(rawCase, &existing); err != nil {
+				return err
+			}
+			cp := existing
+			result, reused = &cp, true
+			return nil
+		}
+		cb := tx.Bucket(bucket)
+		raw := cb.Get([]byte(c.ID))
+		if raw == nil {
+			return domain.ErrNotFound
+		}
+		var before domain.ReleaseCase
+		if err := json.Unmarshal(raw, &before); err != nil {
+			return err
+		}
+		if expectedVersion >= 0 && before.Version != expectedVersion {
+			return domain.ErrVersionConflict
+		}
+		encoded, err := json.Marshal(c)
+		if err != nil {
+			return err
+		}
+		if err = cb.Put([]byte(c.ID), encoded); err != nil {
+			return err
+		}
+		entry := domain.NewAudit(0, c.ID, action, actor, domain.HashText(string(raw)), domain.HashText(string(encoded)))
+		entry.Metadata = metadata
+		if err = putAudit(tx, entry); err != nil {
+			return err
+		}
+		rec := IdempotencyRecord{Key: key, RequestDigest: requestDigest, CaseID: c.ID, CreatedAt: time.Now().UTC()}
+		rawRec, err := json.Marshal(rec)
+		if err != nil {
+			return err
+		}
+		if err = ib.Put(ik, rawRec); err != nil {
+			return err
+		}
+		cp := *c
+		result = &cp
+		return nil
+	})
+	return result, reused, err
+}
+
 func (s *Store) FindCredential(id string) (*domain.ReleaseCase, *domain.FabricationCredential, error) {
 	var foundCase *domain.ReleaseCase
 	var found *domain.FabricationCredential
