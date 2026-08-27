@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"tactile-review/internal/compliance"
 	"tactile-review/internal/domain"
 	"tactile-review/internal/store"
@@ -14,9 +15,11 @@ import (
 )
 
 type Service struct {
-	Store  *store.Store
-	Secret string
-	Idem   *store.Idempotency
+	Store          *store.Store
+	Secret         string
+	Idem           *store.Idempotency
+	previewMu      sync.Mutex
+	freezePreviews map[string]*domain.Manifest
 }
 
 type CreateCaseCommand struct {
@@ -57,7 +60,7 @@ type VerificationResult struct {
 }
 
 func New(s *store.Store) *Service {
-	return &Service{Store: s, Secret: "tactile-review-local-secret", Idem: store.NewIdempotency()}
+	return &Service{Store: s, Secret: "tactile-review-local-secret", Idem: store.NewIdempotency(), freezePreviews: map[string]*domain.Manifest{}}
 }
 
 func (a *Service) PreflightCreate(cmd CreateCaseCommand) CreatePreflight {
@@ -554,7 +557,15 @@ func (a *Service) PreviewFreeze(id string) (*domain.Manifest, error) {
 			return nil, fmt.Errorf("存在未关闭退回项")
 		}
 	}
-	return domain.BuildManifest(c, time.Time{}), nil
+	cacheKey := fmt.Sprintf("%s:%d", c.ID, c.Version)
+	a.previewMu.Lock()
+	defer a.previewMu.Unlock()
+	if preview := a.freezePreviews[cacheKey]; preview != nil {
+		return preview, nil
+	}
+	preview := domain.BuildManifest(c, time.Time{})
+	a.freezePreviews[cacheKey] = preview
+	return preview, nil
 }
 func (a *Service) FreezeConfirm(id string, expected int, previewDigest string) (*domain.ReleaseCase, error) {
 	c, err := a.Store.Get(id)
